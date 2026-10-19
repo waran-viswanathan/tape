@@ -162,9 +162,40 @@ function decode(data: unknown, types: ReadonlySet<string>): unknown {
 }
 
 export function decodeServerMessage(data: unknown): ServerMessage | null {
-  return decode(data, SERVER_TYPES) as ServerMessage | null;
+  const msg = decode(data, SERVER_TYPES);
+  if (!object(msg)) return null;
+  switch (msg['type']) {
+    case 'hello': return finite(msg['serverTime']) && Array.isArray(msg['channels']) && msg['channels'].every(text) ? msg as unknown as HelloMessage : null;
+    case 'subscribed': return text(msg['channel']) && sequence(msg['seq']) ? msg as unknown as SubscribedMessage : null;
+    case 'unsubscribed': return text(msg['channel']) ? msg as unknown as UnsubscribedMessage : null;
+    case 'update': return text(msg['channel']) && sequence(msg['seq']) && Array.isArray(msg['updates']) && msg['updates'].every((row: unknown) => record(row, false)) ? msg as unknown as UpdateMessage : null;
+    case 'pong': return finite(msg['t']) && finite(msg['serverTime']) ? msg as unknown as PongMessage : null;
+    case 'error': return typeof msg['code'] === 'string' && typeof msg['message'] === 'string' ? msg as unknown as ErrorMessage : null;
+    default: return null;
+  }
 }
 
 export function decodeClientMessage(data: unknown): ClientMessage | null {
-  return decode(data, CLIENT_TYPES) as ClientMessage | null;
+  const msg = decode(data, CLIENT_TYPES);
+  if (!object(msg)) return null;
+  if (msg['type'] === 'ping') return finite(msg['t']) ? msg as unknown as PingMessage : null;
+  return text(msg['channel']) ? msg as unknown as SubscribeMessage | UnsubscribeMessage : null;
 }
+
+const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+const sequence = (value: unknown): value is number => finite(value) && Number.isSafeInteger(value) && value >= 0;
+const scalar = (value: unknown): boolean => value === null || typeof value === 'string' || typeof value === 'boolean' || finite(value);
+const entry = (value: unknown): boolean => object(value) && Object.values(value).every(scalar);
+function record(value: unknown, snapshot: boolean): boolean {
+  if (!object(value) || !text(value['id']) || !finite(value['ts']) || !object(value['fields'])) return false;
+  return Object.values(value['fields']).every(field => scalar(field) || (snapshot ? Array.isArray(field) && field.every(entry) : entry(field)));
+}
+
+/** Validate the full snapshot before clearing or changing any stored records. */
+export function isSnapshotResponse(value: unknown, channel: string): value is SnapshotResponse {
+  return object(value) && value['channel'] === channel && sequence(value['seq']) && finite(value['serverTime'])
+    && Array.isArray(value['records']) && value['records'].every((row: unknown) => record(row, true));
+}
+

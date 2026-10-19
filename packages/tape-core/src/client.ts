@@ -20,7 +20,7 @@
  * unmodified in Node 22.
  */
 
-import { SNAPSHOT_PATH } from './protocol';
+import { isSnapshotResponse, SNAPSHOT_PATH } from './protocol';
 import type { ServerMessage, SnapshotResponse, UpdateMessage } from './protocol';
 import { compilePolicy } from './policy';
 import type { PolicySpec } from './policy';
@@ -50,6 +50,7 @@ export const TAPE_DEFAULTS = {
   heartbeat: { intervalMs: 1_000, timeoutMs: 2_500 },
   reorder: { window: 16, timeoutMs: 250 },
   flushBudgetMs: 8,
+  resync: { timeoutMs: 10_000, maxMessages: 10_000, maxBytes: 8 * 1024 * 1024, maxAgeMs: 10_000 },
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -85,16 +86,16 @@ function defaultWebSocketFactory(): WebSocketFactory {
 }
 
 function defaultFetch(): FetchLike {
-  return (url) => {
+  return (url, options) => {
     const fetchImpl = (globalThis as {
-      fetch?: (url: string) => Promise<FetchResponseLike>;
+      fetch?: FetchLike;
     }).fetch;
     if (typeof fetchImpl !== 'function') {
       return Promise.reject(
         new Error('tape-core: no global fetch; inject options.fetchFn'),
       );
     }
-    return fetchImpl.call(globalThis, url) as Promise<FetchResponseLike>;
+    return fetchImpl.call(globalThis, url, options) as Promise<FetchResponseLike>;
   };
 }
 
@@ -161,7 +162,6 @@ interface ChannelState {
   readonly policySpec: PolicySpec;
   readonly store: TapeStore;
   sequencer: ChannelSequencer;
-  subscription: Subscription;
   refcount: number;
   priority: number;
   wantSnapshot: boolean;
@@ -173,6 +173,11 @@ interface ChannelState {
   resyncBuffer: UpdateMessage[];
   /** Bumped to invalidate in-flight snapshot fetches. */
   resyncToken: number;
+  resyncBytes: number;
+  retryAttempt: number;
+  retryTimer: unknown;
+  bufferTimer: unknown;
+  cancelFetch: (() => void) | null;
 }
 
 export function createTapeClient(options: TapeClientOptions): TapeClient {
@@ -195,6 +200,10 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
     timeoutMs: options.reorder?.timeoutMs ?? TAPE_DEFAULTS.reorder.timeoutMs,
   };
   const flushBudgetMs = options.flushBudgetMs ?? TAPE_DEFAULTS.flushBudgetMs;
+  const resync = { ...TAPE_DEFAULTS.resync, ...options.resync };
+  for (const [key, value] of Object.entries(resync)) {
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`tape-core: resync.${key} must be a positive safe integer`);
+  }
   const snapshotBase = options.snapshotUrl ?? deriveSnapshotUrl(options.url);
 
   const metrics = new Metrics();
@@ -231,19 +240,34 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
   function handleSocketDown(): void {
     for (const ch of channels.values()) {
       ch.resyncToken++; // any in-flight snapshot is now for a dead socket
+      cancelResyncWork(ch);
       ch.phase = 'unsynced';
       ch.resyncBuffer.length = 0;
+      ch.resyncBytes = 0;
       ch.sequencer.deactivate();
     }
     updateResyncCount();
   }
 
-  function handleServerMessage(msg: ServerMessage): void {
+  function handleServerMessage(msg: ServerMessage, wireBytes: number): void {
     if (msg.type === 'update') {
       const ch = channels.get(msg.channel);
       if (ch === undefined) return;
       if (ch.phase === 'synced') ch.sequencer.push(msg);
-      else if (ch.phase === 'syncing') insertBySeq(ch.resyncBuffer, msg);
+      else if (ch.phase === 'syncing') {
+        if (ch.resyncBuffer.length >= resync.maxMessages || ch.resyncBytes + wireBytes > resync.maxBytes) {
+          restartResync();
+          return;
+        }
+        if (ch.resyncBuffer.length === 0) {
+          ch.bufferTimer = timers.schedule(() => {
+            ch.bufferTimer = null;
+            if (ch.phase === 'syncing') restartResync();
+          }, resync.maxAgeMs);
+        }
+        insertBySeq(ch.resyncBuffer, msg);
+        ch.resyncBytes += wireBytes;
+      }
       return;
     }
     if (msg.type === 'subscribed') {
@@ -260,9 +284,12 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
   }
 
   function startResync(ch: ChannelState, via: SyncVia): void {
+    cancelResyncWork(ch);
     ch.phase = 'syncing';
     ch.syncVia = via;
     ch.resyncBuffer.length = 0;
+    ch.resyncBytes = 0;
+    ch.retryAttempt = 0;
     const token = ++ch.resyncToken;
     updateResyncCount();
     if (via === 'snapshot') void fetchSnapshot(ch, token);
@@ -272,18 +299,37 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
     const url =
       snapshotBase + SNAPSHOT_PATH + '?channel=' + encodeURIComponent(ch.channel);
     let body: SnapshotResponse;
+    const controller = new AbortController();
+    let timeout: unknown = null;
+    let cancel = () => {};
+    const deadline = new Promise<never>((_resolve, reject) => {
+      cancel = () => { controller.abort(); reject(new Error('snapshot cancelled or timed out')); };
+      timeout = timers.schedule(cancel, resync.timeoutMs);
+    });
+    ch.cancelFetch = cancel;
     try {
-      const res = await fetchFn(url);
-      if (!isCurrent(ch, token)) return;
-      if (!res.ok) throw new Error(`snapshot fetch failed: ${res.status}`);
-      body = (await res.json()) as SnapshotResponse;
+      body = await Promise.race([
+        (async () => {
+          const response = await fetchFn(url, { signal: controller.signal });
+          if (!response.ok) throw new Error(`snapshot fetch failed: ${response.status}`);
+          const candidate: unknown = await response.json();
+          if (!isSnapshotResponse(candidate, ch.channel)) throw new Error('invalid snapshot');
+          return candidate;
+        })(),
+        deadline,
+      ]);
     } catch {
       if (!isCurrent(ch, token)) return;
-      // Retry while this resync attempt is still the current one.
-      timers.schedule(() => {
+      metrics.snapshotFailures++;
+      const delay = Math.min(backoff.capMs, backoff.baseMs * 2 ** Math.min(ch.retryAttempt++, 30));
+      ch.retryTimer = timers.schedule(() => {
+        ch.retryTimer = null;
         if (isCurrent(ch, token)) void fetchSnapshot(ch, token);
-      }, backoff.baseMs);
+      }, delay);
       return;
+    } finally {
+      timers.cancel(timeout);
+      if (ch.cancelFetch === cancel) ch.cancelFetch = null;
     }
     if (!isCurrent(ch, token)) return;
     // Pending coalesce state predates the snapshot: the snapshot supersedes
@@ -291,6 +337,22 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
     buffer.clearPending(ch.channel);
     ch.store.applySnapshot(body.records);
     completeSync(ch, body.seq);
+  }
+
+  function cancelResyncWork(ch: ChannelState): void {
+    if (ch.retryTimer !== null) timers.cancel(ch.retryTimer);
+    if (ch.bufferTimer !== null) timers.cancel(ch.bufferTimer);
+    ch.retryTimer = null;
+    ch.bufferTimer = null;
+    ch.cancelFetch?.();
+    ch.cancelFetch = null;
+  }
+
+  function restartResync(): void {
+    // Start with a new snapshot and stream after bounded transport backoff.
+    // Clearing only part of a delta stream would silently corrupt totals.
+    metrics.resyncRestarts++;
+    transport.restart();
   }
 
   function isCurrent(ch: ChannelState, token: number): boolean {
@@ -304,10 +366,12 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
 
   /** Arm the sequencer at `seq`, replay buffered updates > seq, go live. */
   function completeSync(ch: ChannelState, seq: number): void {
+    cancelResyncWork(ch);
     ch.sequencer.reset(seq);
     ch.phase = 'synced';
     const buffered = ch.resyncBuffer;
     ch.resyncBuffer = [];
+    ch.resyncBytes = 0;
     for (const msg of buffered) {
       if (msg.seq > seq) ch.sequencer.push(msg);
       // seq <= baseline: already contained in the snapshot — discard.
@@ -350,7 +414,7 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
         );
       }
       existing.refcount++;
-      return existing.subscription as unknown as Subscription<F>;
+      return consumerHandle<F>(existing);
     }
     const compiled = compilePolicy(policy); // once per subscription
     const store = new TapeStore(compiled, metrics);
@@ -361,7 +425,6 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
       policySpec: policy,
       store,
       sequencer: undefined as unknown as ChannelSequencer,
-      subscription: undefined as unknown as Subscription,
       refcount: 1,
       priority,
       wantSnapshot,
@@ -370,6 +433,11 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
       syncVia: 'snapshot',
       resyncBuffer: [],
       resyncToken: 0,
+      resyncBytes: 0,
+      retryAttempt: 0,
+      retryTimer: null,
+      bufferTimer: null,
+      cancelFetch: null,
     };
     ch.sequencer = new ChannelSequencer({
       channel,
@@ -380,7 +448,6 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
       onDeliver: (msg) => buffer.ingest(channel, msg.updates),
       onGap: (gap) => handleGap(ch, gap),
     });
-    ch.subscription = { channel, store, close: () => release(ch) };
     channels.set(channel, ch);
     buffer.addChannel(channel, store, compiled, priority);
     if (transport.isOpen()) {
@@ -388,7 +455,16 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
       ch.seenOpen = true;
       startResync(ch, wantSnapshot ? 'snapshot' : 'ack');
     }
-    return ch.subscription as unknown as Subscription<F>;
+    return consumerHandle<F>(ch);
+  }
+
+  function consumerHandle<F extends Fields>(ch: ChannelState): Subscription<F> {
+    let released = false;
+    return {
+      channel: ch.channel,
+      store: ch.store as unknown as Subscription<F>['store'],
+      close: () => { if (!released) { released = true; release(ch); } },
+    };
   }
 
   function release(ch: ChannelState): void {
@@ -399,6 +475,9 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
     buffer.removeChannel(ch.channel);
     ch.sequencer.deactivate();
     ch.resyncToken++;
+    cancelResyncWork(ch);
+    ch.resyncBuffer = [];
+    ch.resyncBytes = 0;
     transport.send({ type: 'unsubscribe', channel: ch.channel });
     updateResyncCount();
   }
@@ -413,8 +492,11 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
       for (const ch of channels.values()) {
         ch.sequencer.deactivate();
         ch.resyncToken++;
+        cancelResyncWork(ch);
+        ch.resyncBuffer = [];
       }
       buffer.dispose();
+      channels.clear();
       transport.close();
     },
     getState: () => transport.getState(),
@@ -427,3 +509,4 @@ export function createTapeClient(options: TapeClientOptions): TapeClient {
     getMetrics: () => metrics.snapshot(),
   };
 }
+

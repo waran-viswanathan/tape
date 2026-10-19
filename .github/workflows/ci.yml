@@ -173,8 +173,8 @@ jobs:
           file: services/feed/Dockerfile
           push: true
           tags: |
-            ghcr.io/lalitheswaran11-stack/tape-feed:latest
-            ghcr.io/lalitheswaran11-stack/tape-feed:${{ github.sha }}
+            ghcr.io/waran-viswanathan/tape-feed:latest
+            ghcr.io/waran-viswanathan/tape-feed:${{ github.sha }}
 
       - name: Build and push tape-monitor
         uses: docker/build-push-action@v6
@@ -183,8 +183,8 @@ jobs:
           file: apps/monitor/Dockerfile
           push: true
           tags: |
-            ghcr.io/lalitheswaran11-stack/tape-monitor:latest
-            ghcr.io/lalitheswaran11-stack/tape-monitor:${{ github.sha }}
+            ghcr.io/waran-viswanathan/tape-monitor:latest
+            ghcr.io/waran-viswanathan/tape-monitor:${{ github.sha }}
 
       - name: Build and push tape-entry
         uses: docker/build-push-action@v6
@@ -193,5 +193,6 @@ jobs:
           file: apps/entry/Dockerfile
           push: true
           tags: |
-            ghcr.io/lalitheswaran11-stack/tape-entry:latest
-            ghcr.io/lalitheswaran11-stack/tape-entry:${{ github.sha }}
+            ghcr.io/waran-viswanathan/tape-entry:latest
+            ghcr.io/waran-viswanathan/tape-entry:${{ github.sha }}
+

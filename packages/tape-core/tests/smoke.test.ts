@@ -57,9 +57,10 @@ describe('plain-Node smoke', () => {
     const h = makeHarness();
     h.fetch.queueSnapshot(snap('quotes', 0, []));
     const a = h.client.subscribe('quotes', { last: 'latest' });
-    // Deep-equal policy (a distinct object) joins the same subscription.
+    // Deep-equal policy joins the same store with an independent close handle.
     const b = h.client.subscribe('quotes', { last: 'latest' });
-    expect(b).toBe(a);
+    expect(b).not.toBe(a);
+    expect(b.store).toBe(a.store);
     // A different policy is a programming error.
     expect(() => h.client.subscribe('quotes', { last: 'accumulate' })).toThrow();
     expect(() =>
@@ -71,7 +72,11 @@ describe('plain-Node smoke', () => {
     s.open();
     await settle();
     a.close(); // refcount 2 → 1: still live
+    a.close(); // duplicate cleanup must not release b
     expect(s.sentOfType('unsubscribe').length).toBe(0);
+    s.push(upd('quotes', 1, [{ id: 'AAPL', fields: { last: 42 } }]));
+    h.frames.fire();
+    expect(b.store.get('AAPL')!.fields['last']).toBe(42);
     b.close(); // refcount 1 → 0: unsubscribe and drop channel state
     expect(s.sentOfType('unsubscribe').map((f) => f.channel)).toEqual([
       'quotes',
@@ -87,6 +92,8 @@ describe('plain-Node smoke', () => {
       heartbeat: { intervalMs: 1_000, timeoutMs: 2_500 },
       reorder: { window: 16, timeoutMs: 250 },
       flushBudgetMs: 8,
+      resync: { timeoutMs: 10_000, maxMessages: 10_000, maxBytes: 8 * 1024 * 1024, maxAgeMs: 10_000 },
     });
   });
 });
+

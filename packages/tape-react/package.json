@@ -21,7 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/lalitheswaran11-stack/tape.git",
+    "url": "https://github.com/waran-viswanathan/tape.git",
     "directory": "packages/tape-react"
   },
   "scripts": {
@@ -48,3 +48,4 @@
     "vitest": "^3.2.0"
   }
 }
+

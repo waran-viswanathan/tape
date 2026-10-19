@@ -12,6 +12,9 @@ const FLUSH_RING_SIZE = 512;
 
 export class Metrics {
   messagesIn = 0;
+  messagesRejected = 0;
+  snapshotFailures = 0;
+  resyncRestarts = 0;
   updatesIn = 0;
   updatesApplied = 0;
   framesFlushed = 0;
@@ -50,6 +53,9 @@ export class Metrics {
     }
     return {
       messagesIn: this.messagesIn,
+      messagesRejected: this.messagesRejected,
+      snapshotFailures: this.snapshotFailures,
+      resyncRestarts: this.resyncRestarts,
       updatesIn: this.updatesIn,
       updatesApplied: this.updatesApplied,
       framesFlushed: this.framesFlushed,
@@ -66,3 +72,4 @@ export class Metrics {
     };
   }
 }
+

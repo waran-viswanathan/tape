@@ -9,7 +9,7 @@
 
 feed:
   image:
-    repository: ghcr.io/lalitheswaran11-stack/tape-feed
+    repository: ghcr.io/waran-viswanathan/tape-feed
     tag: latest
   replicas: 1
   # Feed generator config — injected as TAPE_* env vars.
@@ -28,7 +28,7 @@ feed:
 
 monitor:
   image:
-    repository: ghcr.io/lalitheswaran11-stack/tape-monitor
+    repository: ghcr.io/waran-viswanathan/tape-monitor
     tag: latest
   replicas: 1
   service:
@@ -44,7 +44,7 @@ monitor:
 
 entry:
   image:
-    repository: ghcr.io/lalitheswaran11-stack/tape-entry
+    repository: ghcr.io/waran-viswanathan/tape-entry
     tag: latest
   replicas: 1
   service:
@@ -69,3 +69,4 @@ ingress:
     entry: /entry
     feed: /feed
   annotations: {}
+

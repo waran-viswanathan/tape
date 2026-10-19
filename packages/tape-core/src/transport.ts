@@ -46,7 +46,7 @@ export interface TransportOptions {
   metrics: Metrics;
   /** Socket opened (initial or reconnect). Resubscribe + resync here. */
   onOpen: () => void;
-  onMessage: (msg: ServerMessage) => void;
+  onMessage: (msg: ServerMessage, wireBytes: number) => void;
   /** Socket lost (any reason other than close()). */
   onDown: () => void;
 }
@@ -98,6 +98,11 @@ export class Transport {
 
   isOpen(): boolean {
     return this.socket !== null && this.socket.readyState === SOCKET_OPEN;
+  }
+
+  /** Abandon a stream that cannot be reconciled within the owner's limits. */
+  restart(): void {
+    if (this.phase === 'open') this.forceReconnect();
   }
 
   send(msg: ClientMessage): boolean {
@@ -158,9 +163,9 @@ export class Transport {
     // Any traffic proves the socket is alive, decodable or not.
     this.lastMessageAt = this.opts.now();
     const msg = decodeServerMessage(data);
-    if (msg === null) return; // forward compat: skip unknown frames
+    if (msg === null) { this.opts.metrics.messagesRejected++; return; }
     this.opts.metrics.messagesIn++;
-    this.opts.onMessage(msg);
+    this.opts.onMessage(msg, typeof data === 'string' ? data.length * 2 : 0);
   }
 
   private handleDown(): void {
@@ -249,3 +254,4 @@ export class Transport {
     for (const cb of this.stateSubs) cb(next);
   }
 }
+

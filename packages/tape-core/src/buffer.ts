@@ -11,7 +11,8 @@
  * (descending). After each channel's pending map is applied to its store,
  * elapsed time is measured with the injected now(); once it exceeds
  * flushBudgetMs and channels with pending work remain, the rest defer to the
- * next frame — their pending keeps coalescing, nothing is lost —
+ * next frame, starting at the first deferred channel to prevent starvation.
+ * The budget is soft: a channel flush is atomic. Pending keeps coalescing —
  * deferredFrames counts once for the frame, and another frame is requested
  * immediately. Frames are only requested while pending work exists: an idle
  * client schedules nothing.
@@ -65,6 +66,7 @@ export class CoalescingBuffer {
   /** Priority-descending; rebuilt only when subscriptions change. */
   private sorted: BufferChannel[] = [];
   private frameHandle: unknown = null;
+  private resumeAt: string | null = null;
 
   constructor(private readonly opts: BufferOptions) {}
 
@@ -102,6 +104,9 @@ export class CoalescingBuffer {
       this.opts.scheduler.cancel(this.frameHandle);
       this.frameHandle = null;
     }
+    this.channels.clear();
+    this.sorted = [];
+    this.resumeAt = null;
   }
 
   ingest(channelName: string, updates: readonly RecordUpdate[]): void {
@@ -158,20 +163,28 @@ export class CoalescingBuffer {
     const { now, metrics, flushBudgetMs } = this.opts;
     const start = now();
     const sorted = this.sorted;
+    const resumeIndex = this.resumeAt === null ? -1 : sorted.findIndex(ch => ch.name === this.resumeAt);
+    const first = Math.max(0, resumeIndex);
+    this.resumeAt = null;
     let flushed = false;
     let deferred = false;
     for (let i = 0; i < sorted.length; i++) {
-      const ch = sorted[i]!;
+      const ch = sorted[(first + i) % sorted.length]!;
       if (ch.pending.size === 0) continue;
-      const written = ch.store.flushPending(ch.pending);
-      ch.pending.clear();
+      // Detach the batch before callbacks run: reentrant ingestion belongs
+      // to the next batch and must not be erased after notification.
+      const pending = ch.pending;
+      ch.pending = new Map();
+      const written = ch.store.flushPending(pending);
       metrics.updatesApplied += written;
       flushed = true;
       const elapsed = now() - start;
       if (elapsed > flushBudgetMs) {
         for (let j = i + 1; j < sorted.length; j++) {
-          if (sorted[j]!.pending.size > 0) {
+          const next = sorted[(first + j) % sorted.length]!;
+          if (next.pending.size > 0) {
             deferred = true;
+            this.resumeAt = next.name;
             break;
           }
         }
@@ -202,3 +215,4 @@ export class CoalescingBuffer {
     );
   }
 }
+

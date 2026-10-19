@@ -1,16 +1,18 @@
 # Tape
 
-[![ci](https://github.com/lalitheswaran11-stack/tape/actions/workflows/ci.yml/badge.svg)](https://github.com/lalitheswaran11-stack/tape/actions/workflows/ci.yml)
+[![ci](https://github.com/waran-viswanathan/tape/actions/workflows/ci.yml/badge.svg)](https://github.com/waran-viswanathan/tape/actions/workflows/ci.yml)
 
-Tape is a real-time UI platform: versioned packages, a wire protocol, and two
-independent consumer applications that prove the API surface. A framework-free
-core (`tape-core` — it runs in plain Node) turns a 5 000 msg/s WebSocket
-firehose into frame-budgeted record updates; a thin React binding
-(`tape-react`) exposes them as hooks and a virtualized grid; a deterministic
-seeded feed service with fault injection makes every resilience claim
-testable. The platform is the product here, not the domain — the repo's
-history includes a full major-version migration (deprecation, codemod,
-removal) executed against its own consumers.
+Tape turns a 5,000-message/second WebSocket feed into coalesced UI updates.
+It includes a framework-free TypeScript core, React bindings, two consumer
+apps, and a deterministic feed with fault injection. The interesting engineering
+is recovery from gaps and disconnects, explicit data-loss policies, and measured
+rendering cost under load.
+
+**Try it:** [quickstart](#quickstart) · [recovery contract](docs/POLICIES.md#resync-semantics-gaps-reconnects) ·
+[performance evidence](tools/perf/README.md).
+Every successful browser CI run uploads a `browser-perf-report` artifact with a
+monitor screenshot and the measured frame-budget report. Open a run under
+[Actions](https://github.com/waran-viswanathan/tape/actions/workflows/ci.yml) to inspect it.
 
 ## Data flow
 
@@ -27,7 +29,7 @@ removal) executed against its own consumers.
   |     |                 (unfillable gap -> REST snapshot resync)            |
   |     v                                                                     |
   |  coalescing buffer    per-field policy: latest / accumulate / sequence    |
-  |     |                 8 ms flush budget, priority-ordered shedding        |
+  |     |                 8 ms soft budget, fair channel deferral            |
   |     v                                                                     |
   |  store                copy-on-write records, per-record notify            |
   |                       (a tick on one record never wakes another's         |
@@ -55,7 +57,7 @@ client.subscribe('instruments', {
 
 | Policy | Kept | Lost under load | Use for |
 | --- | --- | --- | --- |
-| `latest` | The newest value at flush time — never more than one frame behind. | Every intermediate value; intermediates are never observable, even transiently. | State: prices, statuses, labels. |
+| `latest` | The newest value when that channel flushes; deferred channels can lag multiple frames. | Every intermediate value; intermediates are never observable, even transiently. | State: prices, statuses, labels. |
 | `accumulate` | Everything — pending numeric deltas sum, and the sum applies whole. A deferred frame loses nothing. | Nothing numerically; only arrival granularity (you see totals, not each increment). | Totals: volume, counters, PnL. |
 | `sequence` | Every entry, in arrival order, up to `capacity` (ring buffer). | Only the oldest entries beyond capacity — never a middle entry, never ordering. | Events: trade tapes, alerts, audit trails. |
 
@@ -63,9 +65,10 @@ Two wire conventions make this exact across reconnects: `accumulate` fields
 are delta-encoded in updates but absolute in snapshots (totals survive a
 resync to the cent), and `sequence` fields carry one entry per update with
 snapshots bearing the recent history. Backpressure sheds by deferring whole
-channels (priority-ordered) once the 8 ms flush budget is spent — deferred
-data keeps coalescing under its policies and applies whole later, and
-shedding is never silent (`deferredFrames` and `coalesceRatio` in metrics).
+channels once the 8 ms soft flush budget is spent. Priority orders the initial
+pass; the next frame starts with the first deferred channel to prevent starvation.
+A single channel flush is atomic and can exceed the budget. Deferred data keeps
+coalescing and applies whole later; deferral is observable (`deferredFrames` and `coalesceRatio` in metrics).
 Full contract: [docs/POLICIES.md](docs/POLICIES.md).
 
 ## Measured
@@ -82,8 +85,8 @@ heterogeneous runner fleet — both bands measured, see
 
 | Path | Measured | Meaning |
 | --- | --- | --- |
-| ingest | ~2.5 µs/msg | decode + sequencer fast path + coalescing, no flush |
-| ingest + flush (e2e) | ~4.1 µs/msg | ~240k msg/s single-thread headroom vs the 5k msg/s feed |
+| ingest | ~2.8 µs/msg | decode + sequencer fast path + coalescing, no flush |
+| ingest + flush (e2e) | ~4.3 µs/msg | ~230k msg/s single-thread headroom vs the 5k msg/s feed |
 | 10k-record snapshot sync | ~1.5 ms | socket open → `live`: two full snapshot reconciles |
 | full flush drain | ~2.6 ms | ~10k staged records through `store.flushPending` |
 
@@ -156,8 +159,12 @@ The feed injects faults on demand; every row is gated by a Playwright spec in
 
 ## Quickstart
 
+Node 22 and pnpm 9 are required.
+
 ```sh
-pnpm install
+git clone https://github.com/waran-viswanathan/tape.git
+cd tape
+pnpm install --frozen-lockfile
 pnpm -r build
 pnpm test
 ```
@@ -190,6 +197,10 @@ node examples/node-consumer/index.mjs ws://localhost:4400
 ```
 
 ## Packages
+
+Library names retain their original `@lalitheswaran11-stack` scope for compatibility;
+repository links and container images use `waran-viswanathan`. The quickstart uses
+local workspace packages and requires no registry credentials.
 
 | Package | Version | What it is |
 | --- | --- | --- |
@@ -248,3 +259,4 @@ Docs: [POLICIES](docs/POLICIES.md) ·
 
 *Honest footnote: the Dockerfiles and the Helm chart are built and validated
 in CI — the dev machine this was written on has no local docker or helm.*
+

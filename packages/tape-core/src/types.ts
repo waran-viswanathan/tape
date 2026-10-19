@@ -76,8 +76,8 @@ export interface RecordStore<F extends Fields = Fields> {
 
 export interface SubscribeOptions {
   /**
-   * Flush priority under backpressure — higher flushes first when the
-   * frame budget forces shedding. Default 0.
+   * Higher priority starts a new drain first. Deferred channels resume
+   * before already-served channels to prevent starvation. Default 0.
    */
   priority?: number;
   /** Reconcile against the REST snapshot on subscribe. Default true. */
@@ -87,12 +87,19 @@ export interface SubscribeOptions {
 export interface Subscription<F extends Fields = Fields> {
   readonly channel: string;
   readonly store: RecordStore<F>;
+  /** Release this consumer once; subsequent calls have no effect. */
   close(): void;
 }
 
 export interface MetricsSnapshot {
   /** Server messages decoded (all types). */
   messagesIn: number;
+  /** Malformed or unrecognized WebSocket messages skipped. */
+  messagesRejected: number;
+  /** Snapshot network, deadline, or validation failures. */
+  snapshotFailures: number;
+  /** Reconnects requested when a resync buffer reaches its limits. */
+  resyncRestarts: number;
   /** RecordUpdates ingested into the coalescing buffer. */
   updatesIn: number;
   /** Record writes applied to stores at flush. */
@@ -149,7 +156,8 @@ export interface FetchResponseLike {
   json(): Promise<unknown>;
 }
 
-export type FetchLike = (url: string) => Promise<FetchResponseLike>;
+/** Injected implementations should honor the signal to release network resources. */
+export type FetchLike = (url: string, options?: { signal?: AbortSignal }) => Promise<FetchResponseLike>;
 
 // ---------------------------------------------------------------------------
 // Client
@@ -186,10 +194,22 @@ export interface TapeClientOptions {
   backoff?: BackoffOptions;
   heartbeat?: HeartbeatOptions;
   reorder?: ReorderOptions;
+  /** Bounds while waiting for a snapshot or initial subscription ack. */
+  resync?: {
+    /** Deadline per snapshot attempt, including JSON decoding. Default 10_000 ms. */
+    timeoutMs?: number;
+    /** Maximum buffered update messages per channel. Default 10_000. */
+    maxMessages?: number;
+    /** Maximum buffered JSON text size (UTF-16 bytes), per channel. Default 8 MiB. */
+    maxBytes?: number;
+    /** Maximum age of the oldest buffered update. Default 10_000 ms. */
+    maxAgeMs?: number;
+  };
   /**
    * Per-frame flush budget (ms). When a flush exceeds it, remaining
-   * channels defer to the next frame (their pending data keeps
-   * coalescing — shedding is visible in metrics, never silent). Default 8.
+   * channels defer and resume first next frame. A channel flush and its
+   * subscriber callbacks are atomic, so this is a soft budget, not a
+   * hard execution-time limit. Default 8.
    */
   flushBudgetMs?: number;
   // Seams — all optional, browser defaults.
@@ -211,8 +231,8 @@ export interface TapeClient {
   onGap(cb: (gap: GapEvent) => void): Unsubscribe;
   /**
    * Subscribe to a channel with a per-field coalescing policy. One live
-   * subscription per channel: subscribing again returns the same
-   * (refcounted) subscription; the policy must match or this throws.
+   * store per channel: each consumer gets its own idempotent close handle;
+   * the policy must match the existing channel or this throws.
    */
   subscribe<F extends Fields = Fields>(
     channel: string,
@@ -221,3 +241,4 @@ export interface TapeClient {
   ): Subscription<F>;
   getMetrics(): MetricsSnapshot;
 }
+

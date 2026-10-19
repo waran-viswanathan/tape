@@ -23,8 +23,8 @@ Fields you do not list default to `latest`.
 Every pending update overwrites the previous pending value; the flush writes
 the newest one.
 
-- **Kept:** the most recent value at flush time. Your UI is never behind by
-  more than one frame.
+- **Kept:** the most recent value when this channel flushes. Deferral can make
+  the rendered value lag by more than one frame.
 - **Lost under load:** every intermediate value. If `last` ticks
   100.1 → 100.2 → 100.3 inside one frame, subscribers observe only 100.3;
   the intermediates are **never observable**, not even transiently.
@@ -77,6 +77,11 @@ channels **defer to the next frame** — which is requested immediately. A
 deferred channel's pending data is not dropped: it keeps coalescing under
 its field policies and applies whole when its turn comes.
 
+The next frame resumes with the first deferred channel, so sustained work on a
+high-priority channel cannot starve another channel. The budget is **soft**: one
+channel flush is atomic and can exceed 8 ms; there is no hard per-frame cap.
+Subscriber callbacks that enqueue updates leave that work for a subsequent frame.
+
 Shedding is **never silent**. Watch two numbers in `getMetrics()`:
 
 - **`deferredFrames`** — frames where the budget forced at least one channel
@@ -115,3 +120,20 @@ absent from the snapshot are removed — and live updates that arrived during
 the fetch are replayed in seq order, skipping anything the snapshot already
 contains. Gaps are visible via `onGap(...)` and `gapsDetected`;
 reconciliation is visible as the `resyncing` connection state.
+
+
+Snapshots are runtime-validated before replacing the store. Malformed wire frames
+are rejected and counted in `messagesRejected`. Each fetch has a 10-second deadline
+(including response parsing), an abort signal, and exponential retry capped by the
+configured reconnect backoff. Failures increment `snapshotFailures`; the last valid
+store remains available while the channel is resyncing.
+
+The live-update buffer during resync is bounded by `resync.maxMessages` (10,000),
+`maxBytes` (8 MiB of decoded JSON text, estimated as two bytes per character), and
+`maxAgeMs` (10 seconds from the first buffered update). Crossing any limit clears
+the incomplete recovery, reconnects, and starts a fresh snapshot; it never silently
+drops a delta and then declares the channel live. `resyncRestarts` counts these
+restarts. These limits bound the recovery buffer, not total process memory.
+
+Each `subscribe` call owns an independent, idempotent `close()` handle. Closing one
+handle twice cannot unsubscribe another consumer of the shared channel store.
